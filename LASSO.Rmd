@@ -1,0 +1,346 @@
+---
+title: "IAG Lasso Regression"
+author: "Andrea De Stefano"
+date: "2023-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## LASSO Regression
+
+LASSO (Least Absolute Shrinkage and Selection Operator) is a regularization technique that shrink data values towards a central point as the mean. The lasso procedure is well-suited for models showing high levels of multicollinearity or for variable selection/parameter elimination.
+
+LASSO is usually considered a better alternative than stepwise regression. Harrell in "Regression Modeling Strategies" (2001), listed the following problems with stepwise regression:
+
+1. R^2 values are biased high.
+2. The F statistics do not have the claimed distribution.
+3. The standard errors of the parameter estimates are too small.
+4. The confidence intervals around the parameter estimates are too narrow.
+5. p-values are too small because to multiple comparisons, and are difficult to correct.
+6. Parameter estimates are biased away from 0.
+7. Collinearity problems are exacerbated.
+
+Which means:
+
+1. Parameter estimates are likely to be too far away from zero.
+2. The variance estimates for those parameter estimates are not correct either
+3. Confidence intervals and hypothesis tests will be wrong
+3. Very hard, if not impossible, correcting these problems.
+
+In LASSO, regularization is implemented by adding a “penalty” term to the best fit derived from the trained data, to achieve a lesser variance with the tested data and also restricts the influence of predictor variables over the output variable by compressing their coefficients.
+
+L1 (LASSO) regularization adds a penalty that is equal to the absolute value of the magnitude of the coefficient. This regularization type can result in sparse models with few coefficients. Some coefficients might become zero and get eliminated from the model. Larger penalties result in coefficient values that are closer to zero (ideal for producing simpler models).
+
+This Document has 2 parts:
+
+1. Data manipulation, assumption checking, outliers and influential observations treatment.
+2. Implementation of LASSO regression with Tidymodels.
+
+The dataset used is from my postdoc project, related to invasive annual grasses.
+
+More info on LASSO can be found on:
+
+https://towardsdatascience.com/stopping-stepwise-why-stepwise-selection-is-bad-and-what-you-should-use-instead-90818b3f52df
+
+https://juliasilge.com/blog/lasso-the-office/
+
+```{r, echo=TRUE}
+
+library(tidyverse)
+library(tidymodels)
+library(MASS)
+library(car)
+library(doParallel)
+library(vip)
+library(visdat)
+library(glmnet)
+library(ggpubr)
+library(knitr)
+
+# Import data
+
+trial2 <- read.csv("https://raw.githubusercontent.com/azd169/postdoc/main/trial2.csv?",
+                 header = T)
+
+# Removing some unnecessary variables
+
+trial2_clean1 <- trial2 %>%
+  dplyr::select( 
+    -c(Plt, Site, Lat, Lon, State,
+       Aspect, Northerness, Easterness, Slope, Texture,
+#       Silt, Sand, Clay, 
+#       pH, SOM, EC, BD, Depth, CEC, CaCO3,
+       treatment, trt1, trt2, trt1rate, trt2rate,
+       collection_date, target,
+       pielou, effective, Inv_Simp, Simpson, rich,  Shannon,  Shannon_nat,
+       intr_cov, nat_cov, gen_cov,
+       ips_cov,
+       59:99)
+  )
+
+# Visualize variables by type
+
+vis_dat(trial2_clean1)
+
+# Change some var type
+
+trial2_clean2 <-
+  trial2_clean1 %>%
+  dplyr::mutate_if(is.integer, as.numeric) %>%
+  mutate(Region = as.factor(Region)) %>% # Level 2 Ecoregion is a factor with 3 levels
+  dplyr::select(-c(Plot))
+
+vis_dat(trial2_clean2)
+
+# Assumptions
+
+par(mfrow = c(2, 2))
+
+mod_iag <- lm(iag_cov ~., trial2_clean2) # Linear regression model IAG
+
+summary(mod_iag)
+
+anova(mod_iag) # R coding for dummy variable (Region)
+
+plot(mod_iag) # iag_cov is non linear and heteroscedastic. Transform
+
+mod_iag_sqrt <- lm(sqrt(iag_cov) ~.,
+                 data = trial2_clean2) # Square root transformation
+
+summary(mod_iag_sqrt)
+
+plot(mod_iag_sqrt) # sqrt(iag_cov) looks good now
+
+# Outliers: Cook's distance and influential points
+
+par(mfrow = c(1, 1))
+
+cooksd_iag <- cooks.distance(mod_iag_sqrt) # Cook's distance
+
+plot(cooksd_iag, pch = "*", cex = 2, main = "Influential Obs by Cooks distance") # Plot cook's distance
+abline(h = 4*mean(cooksd_iag, na.rm = T), col = "red")  # add cutoff line
+
+text(x = 1:length(cooksd_iag) + 1, y = cooksd_iag, labels = ifelse(cooksd_iag> 4*mean(cooksd_iag, na.rm = T),
+                                                           names(cooksd_iag),""), col = "red")  # Add labels
+
+influential_iag <- as.numeric(names(cooksd_iag)[(cooksd_iag > 4*mean(cooksd_iag, na.rm = T))])  # Influential row numbers
+
+trial2_clean <- trial2_clean2[-influential_iag, ] # Removing influential points from dataset
+
+mod_iag_sqrt_scr <- lm(sqrt(iag_cov) ~.,
+                    data = trial2_clean) # Simple linear model on screened data
+
+summary(mod_iag_sqrt_scr)
+
+sqrt(mean(mod_iag_sqrt_scr$residuals^2)) # Calculating RMSE
+
+AIC(mod_iag_sqrt_scr) # AIC
+
+par(mfrow = c(2, 2))
+
+plot(mod_iag_sqrt_scr) # Looks good
+
+# Data splitting 70/30
+
+set.seed(1234)
+
+trial2_split <- initial_split(trial2_clean,
+                              prop = .7,
+                              strata = iag_cov)
+
+trial2_train <- training(trial2_split) # Training dataset
+trial2_test <- testing(trial2_split) # Testing dataset
+
+# Recipe - Pre-processing
+
+iag_rec <- recipe(iag_cov ~ ., data = trial2_train) %>% 
+  step_sqrt(iag_cov) %>% # Square root transformation of iag_cov
+  step_dummy(Region) %>% # Code Ecoregion as dummy variable for regression
+  step_zv(all_numeric(), -all_outcomes()) %>% # Removing vars with 0 variance
+  step_normalize(all_numeric(), -all_outcomes()) # Normalizing numeric variables
+
+# Preparation
+
+iag_prep <- iag_rec %>%
+  prep(strings_as_factors = F)
+
+# Model specification - LASSO
+
+lasso_spec <- linear_reg(penalty = 0.1, mixture = 1) %>% # LASSO regression. Penalty and mixture are arbitrary
+  set_engine("glmnet")
+
+# Workflow
+
+iag_wf <- workflow() %>%
+  add_recipe(iag_rec)
+
+# Fitting LASSO
+
+lasso_fit <- iag_wf %>%
+  add_model(lasso_spec) %>%
+  fit(data = trial2_train)
+
+lasso_fit %>% # Regression coefficients
+  extract_fit_parsnip() %>% 
+  tidy()
+
+# Tuning parameters
+
+set.seed(1234)
+
+iag_boot <- bootstraps(trial2_train, strata = iag_cov) # bootstrap resampling
+
+tune_spec <- linear_reg(mode = "regression",
+                        penalty = tune(),
+                        mixture = 1) %>% 
+  set_engine("glmnet")
+
+lambda_grid <- grid_regular(penalty(), levels = 50)
+
+# Grid tuning
+
+doParallel::registerDoParallel()
+
+set.seed(2020)
+
+lasso_grid <- tune_grid(
+  iag_wf %>% add_model(tune_spec),
+  resamples = iag_boot,
+  grid = lambda_grid
+)
+
+lasso_grid %>% # metrics list
+  collect_metrics() 
+
+p1 <- lasso_grid %>% # Plot with metrics
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+#  scale_x_log10() +
+  theme_classic()
+
+lowest_rmse <- lasso_grid %>%
+  select_best("rmse")
+
+lowest_rmse # penalty value with lowest RMSE 
+
+best_rsq <- lasso_grid %>%
+  select_best("rsq")
+
+best_rsq # penalty value with highest R2
+
+lasso_grid %>%
+  show_best("rmse")
+
+lasso_grid %>%
+  show_best("rsq")
+
+final_lasso <- finalize_workflow(
+  iag_wf %>% add_model(tune_spec),
+  lowest_rmse
+)
+
+# variable importance
+
+p2 <- final_lasso %>%
+  fit(trial2_train) %>%
+  extract_fit_parsnip() %>%
+  vi(lambda = lowest_rmse$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL) +
+  theme_classic()
+
+final_model <- last_fit(
+  final_lasso,
+  trial2_split
+) %>%
+  collect_metrics()
+
+final_model # RMSE and R2
+
+glimpse(final_model) # RMSE and R2 using glimpse
+
+
+# Fitting a model with the tuned penalty and extract coefficients
+
+final_spec <- linear_reg(penalty = 0.0373, mixture = 1) %>% # Model with tuned penalty
+  set_engine("glmnet")
+
+lasso_fit_final <- iag_wf %>% # training
+  add_model(final_spec) %>%
+  fit(data = trial2_train)
+
+coeff <- tidy(lasso_fit_final) # coefficients
+
+coeff1 <- coeff %>% # select non zero coefficients
+  dplyr::filter(estimate != 0)
+
+coeff1
+
+# Predicted vs observed
+
+lasso_fit_final_wf <- workflow() %>%
+  add_model(final_spec) %>%
+  add_recipe(iag_rec)
+
+lasso_fit_final <- lasso_fit_final_wf %>%
+  last_fit(split = trial2_split)
+
+lasso_fit_final_results <- lasso_fit_final %>%
+  collect_predictions()
+
+p3 <- ggscatter(lasso_fit_final_results,
+          x = ".pred",
+          y = "iag_cov",
+          color = "#006EA1",
+          add = "reg.line",
+          add.params = list(color = "black", fill = "gray44"),
+          xlab = "Predicted IAG cover (%)",  
+          ylab = "Measured IAG cover (%)",
+          title = "Predicted vs. Measured IAG cover (%)") +
+  scale_x_continuous(limits =c (0, 10)) +
+  scale_y_continuous(limits = c(0, 10)) +
+  stat_cor(aes(label = paste(after_stat(r.label), after_stat(p.label), sep = "~`,`~")),
+           label.x = 1, label.y = 8, p.accuracy = 0.001, r.accuracy = 0.01, size = 4) +
+  theme_classic()
+
+```
+
+## Including Plots
+
+RMSE and R2:
+
+```{r, echo=FALSE}
+p1
+
+```
+
+Variable Importance
+
+```{r, echo=FALSE}
+p2
+
+```
+
+Predicted vs. Measured
+
+```{r, echo=FALSE}
+p3
+
+```
